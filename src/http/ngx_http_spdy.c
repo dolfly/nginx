@@ -145,6 +145,8 @@ static ngx_int_t ngx_http_spdy_construct_request_line(ngx_http_request_t *r);
 static void ngx_http_spdy_run_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_spdy_init_request_body(ngx_http_request_t *r);
 
+static void ngx_http_spdy_close_stream_handler(ngx_event_t *ev);
+
 static void ngx_http_spdy_handle_connection_handler(ngx_event_t *rev);
 static void ngx_http_spdy_keepalive_handler(ngx_event_t *rev);
 static void ngx_http_spdy_finalize_connection(ngx_http_spdy_connection_t *sc,
@@ -809,6 +811,8 @@ ngx_http_spdy_state_headers(ngx_http_spdy_connection_t *sc, u_char *pos,
     sc->zstream_in.next_in = pos;
     sc->zstream_in.avail_in = size;
     sc->zstream_in.next_out = buf->last;
+
+    /* one byte is reserved for null-termination of the last header value */
     sc->zstream_in.avail_out = buf->end - buf->last - 1;
 
     z = inflate(&sc->zstream_in, Z_NO_FLUSH);
@@ -912,9 +916,14 @@ ngx_http_spdy_state_headers(ngx_http_spdy_connection_t *sc, u_char *pos,
                     return ngx_http_spdy_state_headers_error(sc, pos, end);
                 }
 
+                /* null-terminate the last processed header name or value */
+                *buf->pos = '\0';
+
                 buf = r->header_in;
 
                 sc->zstream_in.next_out = buf->last;
+
+                /* one byte is reserved for null-termination */
                 sc->zstream_in.avail_out = buf->end - buf->last - 1;
 
                 z = inflate(&sc->zstream_in, Z_NO_FLUSH);
@@ -995,6 +1004,9 @@ ngx_http_spdy_state_headers(ngx_http_spdy_connection_t *sc, u_char *pos,
         return ngx_http_spdy_state_save(sc, pos, end,
                                         ngx_http_spdy_state_headers);
     }
+
+    /* null-terminate the last header value */
+    *buf->pos = '\0';
 
     ngx_http_spdy_run_request(r);
 
@@ -1204,6 +1216,7 @@ ngx_http_spdy_state_data(ngx_http_spdy_connection_t *sc, u_char *pos,
         }
 
         if (rb->post_handler) {
+            r->read_event_handler = ngx_http_block_reading;
             rb->post_handler(r);
         }
     }
@@ -1814,7 +1827,7 @@ ngx_http_spdy_create_stream(ngx_http_spdy_connection_t *sc, ngx_uint_t id,
 
     rev->data = fc;
     rev->ready = 1;
-    rev->handler = ngx_http_empty_handler;
+    rev->handler = ngx_http_spdy_close_stream_handler;
     rev->log = log;
 
     ngx_memcpy(wev, rev, sizeof(ngx_event_t));
@@ -1936,6 +1949,9 @@ ngx_http_spdy_parse_header(ngx_http_request_t *r)
             return NGX_HTTP_PARSE_INVALID_HEADER;
         }
 
+        /* null-terminate the previous header value */
+        *p = '\0';
+
         p += NGX_SPDY_NV_NLEN_SIZE;
 
         r->header_name_end = p + len;
@@ -2001,9 +2017,8 @@ ngx_http_spdy_parse_header(ngx_http_request_t *r)
 
         len = ngx_spdy_frame_parse_uint16(p);
 
-        if (!len) {
-            return NGX_ERROR;
-        }
+        /* null-terminate header name */
+        *p = '\0';
 
         p += NGX_SPDY_NV_VLEN_SIZE;
 
@@ -2163,11 +2178,9 @@ ngx_http_spdy_handle_request_header(ngx_http_request_t *r)
 
     h->key.len = r->lowcase_index;
     h->key.data = r->header_name_start;
-    h->key.data[h->key.len] = '\0';
 
     h->value.len = r->header_size;
     h->value.data = r->header_start;
-    h->value.data[h->value.len] = '\0';
 
     h->lowcase_key = h->key.data;
 
@@ -2529,13 +2542,6 @@ ngx_http_spdy_init_request_body(ngx_http_request_t *r)
             return NGX_ERROR;
         }
 
-        if (rb->rest == 0) {
-            buf->in_file = 1;
-            buf->file = &tf->file;
-        } else {
-            rb->buf = buf;
-        }
-
     } else {
 
         if (rb->rest == 0) {
@@ -2546,9 +2552,9 @@ ngx_http_spdy_init_request_body(ngx_http_request_t *r)
         if (buf == NULL) {
             return NGX_ERROR;
         }
-
-        rb->buf = buf;
     }
+
+    rb->buf = buf;
 
     rb->bufs = ngx_alloc_chain_link(r->pool);
     if (rb->bufs == NULL) {
@@ -2604,7 +2610,26 @@ ngx_http_spdy_read_request_body(ngx_http_request_t *r,
 
     r->request_body->post_handler = post_handler;
 
+    r->read_event_handler = ngx_http_test_reading;
+    r->write_event_handler = ngx_http_request_empty_handler;
+
     return NGX_AGAIN;
+}
+
+
+static void
+ngx_http_spdy_close_stream_handler(ngx_event_t *ev)
+{
+    ngx_connection_t    *fc;
+    ngx_http_request_t  *r;
+
+    fc = ev->data;
+    r = fc->data;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "spdy close stream handler");
+
+    ngx_http_spdy_close_stream(r->spdy_stream, 0);
 }
 
 
@@ -2660,7 +2685,8 @@ ngx_http_spdy_close_stream(ngx_http_spdy_stream_t *stream, ngx_int_t rc)
     ev = fc->read;
 
     if (ev->active || ev->disabled) {
-        ngx_del_event(ev, NGX_READ_EVENT, 0);
+        ngx_log_error(NGX_LOG_ALERT, sc->connection->log, 0,
+                      "spdy fake read event was activated");
     }
 
     if (ev->timer_set) {
@@ -2674,7 +2700,8 @@ ngx_http_spdy_close_stream(ngx_http_spdy_stream_t *stream, ngx_int_t rc)
     ev = fc->write;
 
     if (ev->active || ev->disabled) {
-        ngx_del_event(ev, NGX_WRITE_EVENT, 0);
+        ngx_log_error(NGX_LOG_ALERT, sc->connection->log, 0,
+                      "spdy fake write event was activated");
     }
 
     if (ev->timer_set) {
@@ -2805,6 +2832,7 @@ ngx_http_spdy_finalize_connection(ngx_http_spdy_connection_t *sc,
 
     c->error = 1;
     c->read->handler = ngx_http_empty_handler;
+    c->write->handler = ngx_http_empty_handler;
 
     sc->last_out = NULL;
 
@@ -2827,7 +2855,9 @@ ngx_http_spdy_finalize_connection(ngx_http_spdy_connection_t *sc,
             if (stream->waiting) {
                 r->blocked -= stream->waiting;
                 stream->waiting = 0;
+
                 ev = fc->write;
+                ev->delayed = 0;
 
             } else {
                 ev = fc->read;
